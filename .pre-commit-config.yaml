@@ -21,12 +21,12 @@ repos:
         # stages: [push]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: "v1.16.1"
+    rev: "v1.17.0"
     hooks:
       - id: mypy
         exclude: build_helpers
         additional_dependencies:
-          - types-cachetools==6.0.0.20250525
+          - types-cachetools==6.1.0.20250717
           - types-filelock==3.2.7
           - types-requests==2.32.4.20250611
           - types-tabulate==0.9.0.20241207
@@ -44,7 +44,7 @@ repos:
 
   - repo: https://github.com/charliermarsh/ruff-pre-commit
     # Ruff version.
-    rev: 'v0.12.3'
+    rev: 'v0.12.4'
     hooks:
       - id: ruff
       - id: ruff-format
