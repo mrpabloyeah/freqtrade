@@ -73,6 +73,7 @@ from freqtrade.exchange.exchange_types import (
     CcxtOrder,
     CcxtPosition,
     FtHas,
+    FundingRate,
     OHLCVResponse,
     OrderBook,
     Ticker,
@@ -2001,6 +2002,30 @@ class Exchange:
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
 
+    @retrier
+    def fetch_funding_rate(self, pair: str) -> FundingRate:
+        """
+        Get current Funding rate from exchange.
+        On Futures markets, this is the interest rate for holding a position.
+        Won't work for non-futures markets
+        """
+        try:
+            if pair not in self.markets or self.markets[pair].get("active", False) is False:
+                raise ExchangeError(f"Pair {pair} not available")
+            return self._api.fetch_funding_rate(pair)
+        except ccxt.NotSupported as e:
+            raise OperationalException(
+                f"Exchange {self._api.name} does not support fetching funding rate. Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get funding rate due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
     @staticmethod
     def get_next_limit_in_list(
         limit: int,
@@ -2566,13 +2591,18 @@ class Exchange:
         input_coroutines: list[Coroutine[Any, Any, OHLCVResponse]] = []
         cached_pairs = []
         for pair, timeframe, candle_type in set(pair_list):
-            if timeframe not in self.timeframes and candle_type in (
+            invalid_funding = (
+                candle_type == CandleType.FUNDING_RATE
+                and timeframe != self.get_option("funding_fee_timeframe")
+            )
+            invalid_timeframe = timeframe not in self.timeframes and candle_type in (
                 CandleType.SPOT,
                 CandleType.FUTURES,
-            ):
+            )
+            if invalid_timeframe or invalid_funding:
                 logger.warning(
-                    f"Cannot download ({pair}, {timeframe}) combination as this timeframe is "
-                    f"not available on {self.name}. Available timeframes are "
+                    f"Cannot download ({pair}, {timeframe}, {candle_type}) combination as this "
+                    f"timeframe is not available on {self.name}. Available timeframes are "
                     f"{', '.join(self.timeframes)}."
                 )
                 continue
