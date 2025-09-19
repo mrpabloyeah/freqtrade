@@ -138,6 +138,7 @@ class Exchange:
         "ohlcv_has_history": True,  # Some exchanges (Kraken) don't provide history via ohlcv
         "ohlcv_partial_candle": True,
         "ohlcv_require_since": False,
+        "download_data_parallel_quick": True,
         "always_require_api_keys": False,  # purge API keys for Dry-run. Must default to false.
         # Check https://github.com/ccxt/ccxt/issues/10767 for removal of ohlcv_volume_currency
         "ohlcv_volume_currency": "base",  # "base" or "quote"
@@ -691,12 +692,13 @@ class Exchange:
             # Reload async markets, then assign them to sync api
             retrier(self._load_async_markets, retries=retries)(reload=True)
             self._markets = self._api_async.markets
-            self._api.set_markets(self._api_async.markets, self._api_async.currencies)
+            self._api.set_markets_from_exchange(self._api_async)
             # Assign options array, as it contains some temporary information from the exchange.
+            # TODO: investigate with ccxt if it's safe to remove `.options`
             self._api.options = self._api_async.options
             if self._exchange_ws:
                 # Set markets to avoid reloading on websocket api
-                self._ws_async.set_markets(self._api.markets, self._api.currencies)
+                self._ws_async.set_markets_from_exchange(self._api_async)
                 self._ws_async.options = self._api.options
             self._last_markets_refresh = dt_ts()
 
@@ -2481,7 +2483,14 @@ class Exchange:
                         data.extend(new_data)
         # Sort data again after extending the result - above calls return in "async order"
         data = sorted(data, key=lambda x: x[0])
-        return pair, timeframe, candle_type, data, self._ohlcv_partial_candle
+        return (
+            pair,
+            timeframe,
+            candle_type,
+            data,
+            # funding_rates are always complete, so never need to be dropped.
+            self._ohlcv_partial_candle if candle_type != CandleType.FUNDING_RATE else False,
+        )
 
     def _try_build_from_websocket(
         self, pair: str, timeframe: str, candle_type: CandleType
@@ -2600,10 +2609,15 @@ class Exchange:
                 CandleType.FUTURES,
             )
             if invalid_timeframe or invalid_funding:
+                timeframes_ = (
+                    ", ".join(self.timeframes)
+                    if candle_type != CandleType.FUNDING_RATE
+                    else self.get_option("funding_fee_timeframe")
+                )
                 logger.warning(
                     f"Cannot download ({pair}, {timeframe}, {candle_type}) combination as this "
                     f"timeframe is not available on {self.name}. Available timeframes are "
-                    f"{', '.join(self.timeframes)}."
+                    f"{timeframes_}."
                 )
                 continue
 
@@ -2786,7 +2800,7 @@ class Exchange:
                 timeframe, candle_type=candle_type, since_ms=since_ms
             )
 
-            if candle_type and candle_type != CandleType.SPOT:
+            if candle_type and candle_type not in (CandleType.SPOT, CandleType.FUTURES):
                 params.update({"price": candle_type.value})
             if candle_type != CandleType.FUNDING_RATE:
                 data = await self._api_async.fetch_ohlcv(
@@ -2801,8 +2815,6 @@ class Exchange:
                     since_ms=since_ms,
                 )
             # Some exchanges sort OHLCV in ASC order and others in DESC.
-            # Ex: Bittrex returns the list of OHLCV in ASC order (oldest first, newest last)
-            # while GDAX returns the list of OHLCV in DESC order (newest first, oldest last)
             # Only sort if necessary to save computing time
             try:
                 if data and data[0][0] > data[-1][0]:
@@ -2811,7 +2823,14 @@ class Exchange:
                 logger.exception("Error loading %s. Result was %s.", pair, data)
                 return pair, timeframe, candle_type, [], self._ohlcv_partial_candle
             logger.debug("Done fetching pair %s, %s interval %s...", pair, candle_type, timeframe)
-            return pair, timeframe, candle_type, data, self._ohlcv_partial_candle
+            return (
+                pair,
+                timeframe,
+                candle_type,
+                data,
+                # funding_rates are always complete, so never need to be dropped.
+                self._ohlcv_partial_candle if candle_type != CandleType.FUNDING_RATE else False,
+            )
 
         except ccxt.NotSupported as e:
             raise OperationalException(
