@@ -4,7 +4,7 @@ import sys
 from typing import Any
 
 from freqtrade.enums import RunMode
-from freqtrade.exceptions import ConfigurationError, OperationalException
+from freqtrade.exceptions import ConfigurationError, DependencyException, OperationalException
 
 
 logger = logging.getLogger(__name__)
@@ -166,7 +166,14 @@ def start_list_strategies(args: dict[str, Any]) -> None:
     strategy_objs = sorted(strategy_objs, key=lambda x: x["name"])
     for obj in strategy_objs:
         if obj["class"]:
-            obj["hyperoptable"] = detect_all_parameters(obj["class"])
+            try:
+                obj["hyperoptable"] = detect_all_parameters(obj["class"])
+            except DependencyException as e:
+                logger.warning(
+                    f"Cannot detect hyperoptable parameters for strategy {obj['name']}. Reason: {e}"
+                )
+                obj["hyperoptable"] = {}
+
         else:
             obj["hyperoptable"] = {}
 
@@ -386,7 +393,7 @@ def start_show_trades(args: dict[str, Any]) -> None:
     tfilter = []
 
     if config.get("trade_ids"):
-        tfilter.append(Trade.id.in_(config["trade_ids"]))
+        tfilter.append(Trade.id.in_(int(tid) for tid in config["trade_ids"]))
 
     trades = Trade.get_trades(tfilter).all()
     logger.info(f"Printing {len(trades)} Trades: ")

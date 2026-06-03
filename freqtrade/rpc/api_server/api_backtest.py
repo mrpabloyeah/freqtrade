@@ -16,10 +16,11 @@ from freqtrade.data.btanalysis import (
     get_backtest_market_change,
     get_backtest_result,
     get_backtest_resultlist,
+    get_backtest_wallet_change,
     load_and_merge_backtest_result,
     update_backtest_metadata,
 )
-from freqtrade.enums import BacktestState
+from freqtrade.enums import BacktestState, RunMode
 from freqtrade.exceptions import ConfigurationError, DependencyException, OperationalException
 from freqtrade.ft_types import get_BacktestResultType_default
 from freqtrade.misc import deep_merge_dicts, is_file_in_dir
@@ -29,8 +30,9 @@ from freqtrade.rpc.api_server.api_schemas import (
     BacktestMetadataUpdate,
     BacktestRequest,
     BacktestResponse,
+    WalletHistoryResponse,
 )
-from freqtrade.rpc.api_server.deps import get_config
+from freqtrade.rpc.api_server.deps import get_config, verify_strategy
 from freqtrade.rpc.api_server.webserver_bgwork import ApiBG
 from freqtrade.rpc.rpc import RPCException
 
@@ -106,6 +108,11 @@ def __run_backtest_bg(btconfig: Config):
                     ApiBG.bt["bt"].results,
                     datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                     market_change_data=combined_res,
+                    wallet_summary={
+                        s: x["wallet_summary"]
+                        for s, x in ApiBG.bt["bt"].all_bt_content.items()
+                        if "wallet_summary" in x
+                    },
                     strategy_files={
                         s.get_strategy_name(): s.__file__ for s in ApiBG.bt["bt"].strategylist
                     },
@@ -125,7 +132,7 @@ def __run_backtest_bg(btconfig: Config):
         ApiBG.bgtask_running = False
 
 
-@router.post("/backtest", response_model=BacktestResponse, tags=["webserver", "backtest"])
+@router.post("/backtest", response_model=BacktestResponse)
 async def api_start_backtest(
     bt_settings: BacktestRequest, background_tasks: BackgroundTasks, config=Depends(get_config)
 ):
@@ -134,10 +141,10 @@ async def api_start_backtest(
     if ApiBG.bgtask_running:
         raise RPCException("Bot Background task already running")
 
-    if ":" in bt_settings.strategy:
-        raise HTTPException(status_code=500, detail="base64 encoded strategies are not allowed.")
+    verify_strategy(bt_settings.strategy)
 
     btconfig = deepcopy(config)
+    btconfig["runmode"] = RunMode.BACKTEST
     remove_exchange_credentials(btconfig["exchange"], True)
     settings = dict(bt_settings)
     if settings.get("freqai", None) is not None:
@@ -168,7 +175,7 @@ async def api_start_backtest(
     }
 
 
-@router.get("/backtest", response_model=BacktestResponse, tags=["webserver", "backtest"])
+@router.get("/backtest", response_model=BacktestResponse)
 def api_get_backtest():
     """
     Get backtesting result.
@@ -215,7 +222,7 @@ def api_get_backtest():
     }
 
 
-@router.delete("/backtest", response_model=BacktestResponse, tags=["webserver", "backtest"])
+@router.delete("/backtest", response_model=BacktestResponse)
 def api_delete_backtest():
     """Reset backtesting"""
     if ApiBG.bgtask_running:
@@ -242,7 +249,7 @@ def api_delete_backtest():
     }
 
 
-@router.get("/backtest/abort", response_model=BacktestResponse, tags=["webserver", "backtest"])
+@router.get("/backtest/abort", response_model=BacktestResponse)
 def api_backtest_abort():
     if not ApiBG.bgtask_running:
         return {
@@ -262,17 +269,13 @@ def api_backtest_abort():
     }
 
 
-@router.get(
-    "/backtest/history", response_model=list[BacktestHistoryEntry], tags=["webserver", "backtest"]
-)
+@router.get("/backtest/history", response_model=list[BacktestHistoryEntry])
 def api_backtest_history(config=Depends(get_config)):
     # Get backtest result history, read from metadata files
     return get_backtest_resultlist(config["user_data_dir"] / "backtest_results")
 
 
-@router.get(
-    "/backtest/history/result", response_model=BacktestResponse, tags=["webserver", "backtest"]
-)
+@router.get("/backtest/history/result", response_model=BacktestResponse)
 def api_backtest_history_result(filename: str, strategy: str, config=Depends(get_config)):
     # Get backtest result history, read from metadata files
     bt_results_base: Path = config["user_data_dir"] / "backtest_results"
@@ -299,11 +302,7 @@ def api_backtest_history_result(filename: str, strategy: str, config=Depends(get
     }
 
 
-@router.delete(
-    "/backtest/history/{file}",
-    response_model=list[BacktestHistoryEntry],
-    tags=["webserver", "backtest"],
-)
+@router.delete("/backtest/history/{file}", response_model=list[BacktestHistoryEntry])
 def api_delete_backtest_history_entry(file: str, config=Depends(get_config)):
     # Get backtest result history, read from metadata files
     bt_results_base: Path = config["user_data_dir"] / "backtest_results"
@@ -319,11 +318,7 @@ def api_delete_backtest_history_entry(file: str, config=Depends(get_config)):
     return get_backtest_resultlist(config["user_data_dir"] / "backtest_results")
 
 
-@router.patch(
-    "/backtest/history/{file}",
-    response_model=list[BacktestHistoryEntry],
-    tags=["webserver", "backtest"],
-)
+@router.patch("/backtest/history/{file}", response_model=list[BacktestHistoryEntry])
 def api_update_backtest_history_entry(
     file: str, body: BacktestMetadataUpdate, config=Depends(get_config)
 ):
@@ -346,11 +341,7 @@ def api_update_backtest_history_entry(
     return get_backtest_result(file_abs)
 
 
-@router.get(
-    "/backtest/history/{file}/market_change",
-    response_model=BacktestMarketChange,
-    tags=["webserver", "backtest"],
-)
+@router.get("/backtest/history/{file}/market_change", response_model=BacktestMarketChange)
 def api_get_backtest_market_change(file: str, config=Depends(get_config)):
     bt_results_base: Path = config["user_data_dir"] / "backtest_results"
     for fn in (
@@ -370,4 +361,30 @@ def api_get_backtest_market_change(file: str, config=Depends(get_config)):
         "columns": df.columns.tolist(),
         "data": df.values.tolist(),
         "length": len(df),
+    }
+
+
+@router.get(
+    "/backtest/history/{file}/{strategy}/wallet",
+    response_model=WalletHistoryResponse,
+    tags=["webserver", "backtest"],
+)
+def api_get_backtest_wallet(file: str, strategy: str, config=Depends(get_config)):
+    bt_results_base: Path = config["user_data_dir"] / "backtest_results"
+    file_abs = (bt_results_base / file).with_suffix(".zip")
+    # Ensure file is in backtest_results directory
+    if not is_file_in_dir(file_abs, bt_results_base):
+        raise HTTPException(status_code=400, detail="Unable to retrieve wallet history.")
+
+    results = get_backtest_wallet_change(file_abs, strategy)
+    if results is None:
+        raise HTTPException(status_code=404, detail="Unable to retrieve wallet history.")
+    # Consolidate the wallet to the base currency
+    results.loc[:, "total_quote"] = results["rate"] * results["balance"]
+    results = results.groupby(["date", "__date_ts"]).agg({"total_quote": "sum"}).reset_index()
+
+    return {
+        "columns": results.columns.tolist(),
+        "data": results.values.tolist(),
+        "length": len(results),
     }
