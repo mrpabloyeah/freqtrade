@@ -164,6 +164,17 @@ CONF_SCHEMA = {
             "description": "Enable recursive strategy search.",
             "type": "boolean",
         },
+        "strategy": {
+            "description": (
+                "Strategy class name (must be available in the user directory "
+                "under strategies). Additional search paths can be added via strategy_path."
+            ),
+            "type": ["string", "null"],
+        },
+        "strategy_path": {
+            "description": "Additional lookup path for strategy classes.",
+            "type": "string",
+        },
         "user_data_dir": {
             "description": "Path to the user data directory.",
         },
@@ -513,6 +524,17 @@ CONF_SCHEMA = {
         "log_config": {
             "description": "Logging configuration.",
             "$ref": "#/definitions/logging",
+        },
+        "freqaimodel": {
+            "description": (
+                "FreqAI model class name (must be available in the user directory "
+                "under freqaimodels). Additional search paths can be added via freqaimodel_path."
+            ),
+            "type": ["string", "null"],
+        },
+        "freqaimodel_path": {
+            "description": "Additional lookup path for FreqAI model classes.",
+            "type": "string",
         },
         "freqai": {
             "description": "FreqAI configuration.",
@@ -914,41 +936,47 @@ CONF_SCHEMA = {
             "type": "object",
             "properties": {
                 "name": {"description": "Name of the exchange.", "type": "string"},
+                "api_key": {
+                    "description": (
+                        f"API key for the exchange. {__VIA_ENV} FREQTRADE__EXCHANGE__API_KEY"
+                    ),
+                    "type": ["string", "null"],
+                },
                 "key": {
                     "description": (
                         f"API key for the exchange. {__VIA_ENV} FREQTRADE__EXCHANGE__KEY"
+                        " Deprecated, use api_key instead."
                     ),
-                    "type": "string",
-                    "default": "",
+                    "type": ["string", "null"],
                 },
                 "secret": {
                     "description": (
                         f"API secret for the exchange. {__VIA_ENV} FREQTRADE__EXCHANGE__SECRET"
                     ),
-                    "type": "string",
-                    "default": "",
+                    "type": ["string", "null"],
+                    "default": None,
                 },
                 "password": {
                     "description": (
                         "Password for the exchange, if required. "
                         f"{__VIA_ENV} FREQTRADE__EXCHANGE__PASSWORD"
                     ),
-                    "type": "string",
-                    "default": "",
+                    "type": ["string", "null"],
+                    "default": None,
                 },
                 "uid": {
                     "description": (
                         "User ID for the exchange, if required. "
                         f"{__VIA_ENV} FREQTRADE__EXCHANGE__UID"
                     ),
-                    "type": "string",
+                    "type": ["string", "null"],
                 },
                 "account_id": {
                     "description": (
                         "Account ID for the exchange, if required. "
                         f"{__VIA_ENV} FREQTRADE__EXCHANGE__ACCOUNT_ID"
                     ),
-                    "type": "string",
+                    "type": ["string", "null"],
                 },
                 "wallet_address": {
                     "description": (
@@ -956,14 +984,14 @@ CONF_SCHEMA = {
                         "Usually used by DEX exchanges. "
                         f"{__VIA_ENV} FREQTRADE__EXCHANGE__WALLET_ADDRESS"
                     ),
-                    "type": "string",
+                    "type": ["string", "null"],
                 },
                 "private_key": {
                     "description": (
                         "Private key for the exchange, if required. Usually used by DEX exchanges. "
                         f"{__VIA_ENV} FREQTRADE__EXCHANGE__PRIVATE_KEY"
                     ),
-                    "type": "string",
+                    "type": ["string", "null"],
                 },
                 "pair_whitelist": {
                     "description": "List of whitelisted trading pairs.",

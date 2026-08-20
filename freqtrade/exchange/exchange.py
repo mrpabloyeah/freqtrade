@@ -19,7 +19,7 @@ import ccxt
 import ccxt.pro as ccxt_pro
 from ccxt import TICK_SIZE
 from dateutil import parser
-from pandas import DataFrame, concat
+from pandas import DataFrame, Timestamp, concat
 
 from freqtrade.configuration import remove_exchange_credentials
 from freqtrade.constants import (
@@ -160,6 +160,7 @@ class Exchange:
         "funding_fee_timeframe": "1h",
         "ccxt_futures_name": "swap",
         "needs_trading_fees": False,  # use fetch_trading_fees to cache fees
+        "balance_includes_unrealized_pnl": False,  # ccxt "total" is plain wallet balance
         "order_props_in_contracts": ["amount", "filled", "remaining"],
         "fetch_orders_limit_minutes": None,  # "fetch_orders" is not time-limited by default
         # Override createMarketBuyOrderRequiresPrice where ccxt has it wrong
@@ -311,37 +312,43 @@ class Exchange:
         """
         self.close()
 
+    def _close_async_ccxt(self, ccxt_object: ccxt_pro.Exchange | None, name: str) -> None:
+        """
+        Release the aiohttp sessions of an async ccxt object.
+        Errors are logged, but don't propagate as it's only called in shutdown phase.
+        :param name: Name of the object - used for logging only.
+        """
+        if (
+            ccxt_object is not None
+            and inspect.iscoroutinefunction(ccxt_object.close)
+            # ccxt warns about either of these being left behind in its destructor.
+            and (ccxt_object.session or getattr(ccxt_object, "socks_proxy_sessions", None))
+        ):
+            logger.debug(f"Closing {name} ccxt session.")
+            try:
+                self.loop.run_until_complete(ccxt_object.close())
+            except Exception as e:
+                logger.warning(f"Error closing {name} ccxt session: {e.__class__.__name__} {e}")
+
     def close(self):
         if self._exchange_ws:
             self._exchange_ws.cleanup()
-        logger.debug("Exchange object destroyed, closing async loop")
+
         try:
             generic_loop = asyncio.get_running_loop()
         except RuntimeError:
             generic_loop = None
-        loop_running = (getattr(self, "loop", None) and self.loop.is_running()) or (
+        loop = getattr(self, "loop", None)
+        loop_running = (loop and loop.is_running()) or (
             generic_loop is not None and generic_loop.is_running()
         )
 
-        if (
-            getattr(self, "_api_async", None)
-            and inspect.iscoroutinefunction(self._api_async.close)
-            and self._api_async.session
-            and not loop_running
-        ):
-            logger.debug("Closing async ccxt session.")
-            self.loop.run_until_complete(self._api_async.close())
-        if (
-            self._ws_async
-            and inspect.iscoroutinefunction(self._ws_async.close)
-            and self._ws_async.session
-            and not loop_running
-        ):
-            logger.debug("Closing ws ccxt session.")
-            self.loop.run_until_complete(self._ws_async.close())
+        if loop and not loop.is_closed() and not loop_running:
+            self._close_async_ccxt(getattr(self, "_api_async", None), "async")
+            self._close_async_ccxt(self._ws_async, "ws")
 
-        if self.loop and not self.loop.is_closed():
-            self.loop.close()
+        if loop and not loop.is_closed():
+            loop.close()
 
     def _init_async_loop(self) -> asyncio.AbstractEventLoop:
         loop = asyncio.new_event_loop()
@@ -398,8 +405,8 @@ class Exchange:
             ),
             "secret": exchange_config.get("secret"),
             "password": exchange_config.get("password"),
-            "uid": exchange_config.get("uid", ""),
-            "accountId": exchange_config.get("account_id", exchange_config.get("accountId", "")),
+            "uid": exchange_config.get("uid"),
+            "accountId": exchange_config.get("account_id", exchange_config.get("accountId")),
             # DEX attributes:
             "walletAddress": exchange_config.get(
                 "wallet_address", exchange_config.get("walletAddress")
@@ -492,7 +499,6 @@ class Exchange:
         .api will be available at this point.
         Must be overridden in child methods if required.
         """
-        pass
 
     def _log_exchange_response(self, endpoint: str, response, *, add_info=None) -> None:
         """Log exchange responses"""
@@ -566,7 +572,7 @@ class Exchange:
         Return a list of supported quote currencies
         """
         markets = self.markets
-        return sorted(set([x["quote"] for _, x in markets.items()]))
+        return sorted({x["quote"] for _, x in markets.items()})
 
     def get_pair_quote_currency(self, pair: str) -> str:
         """Return a pair's quote currency (base/quote:settlement)"""
@@ -699,7 +705,7 @@ class Exchange:
 
             if isinstance(markets, Exception):
                 raise markets
-            return None
+            return
         except TimeoutError as e:
             logger.warning("Could not load markets. Reason: %s", e)
             raise TemporaryError from e
@@ -716,7 +722,7 @@ class Exchange:
             and self._last_markets_refresh > 0
             and (self._last_markets_refresh + self.markets_refresh_interval > dt_ts())
         ):
-            return None
+            return
         logger.debug("Performing scheduled market reload..")
         try:
             # on initial load, we retry 3 times to ensure we get the markets
@@ -986,6 +992,16 @@ class Exchange:
         Get parameter value from _ft_has
         """
         return self._ft_has.get(param, default)
+
+    def balance_includes_unrealized_pnl(self) -> bool:
+        """
+        Whether the stake currency's "total" balance as returned by get_balances() is account
+        equity (wallet balance + unrealized PnL of open positions) rather than plain wallet
+        balance. Wallets normalizes this away, so that Wallet.total has one single meaning
+        across exchanges and between dry-run and live.
+        Overridable for exchanges where this depends on more than the exchange itself.
+        """
+        return self.get_option("balance_includes_unrealized_pnl", False)
 
     def exchange_has(self, endpoint: str) -> bool:
         """
@@ -1470,8 +1486,13 @@ class Exchange:
                 rate_for_order,
                 params,
             )
-            if order.get("status") is None:
-                # Map empty status to open.
+            if order.get("status") is None or (
+                order.get("status") in ("closed", "expired")
+                and order.get("average") is None
+                and float(order["filled"]) != 0
+            ):
+                # Map empty status to open to force another round.
+                # Some exchanges don't provide the actual execution price for market orders.
                 order["status"] = "open"
 
             if order.get("type") is None:
@@ -2132,9 +2153,10 @@ class Exchange:
                     ticker = tickers_other.get(pair, None)
                 if ticker:
                     rate: float | None = safe_value_fallback(ticker, "last", "ask", None)
-                    if rate and pair.startswith(currency) and not pair.endswith(currency):
-                        rate = 1.0 / rate
-                    return rate
+                    if rate:
+                        if pair.startswith(currency) and not pair.endswith(currency):
+                            rate = 1.0 / rate
+                        return rate
         except ValueError:
             return None
         return None
@@ -2907,37 +2929,43 @@ class Exchange:
         return results_df
 
     def refresh_ohlcv_with_cache(
-        self, pairs: list[PairWithTimeframe], since_ms: int
+        self, pairs: list[PairWithTimeframe], *, lookback_period: int
     ) -> dict[PairWithTimeframe, DataFrame]:
         """
         Refresh ohlcv data for all pairs in needed_pairs if necessary.
-        Caches data with expiring per timeframe.
-        Should only be used for pairlists which need "on time" expirarion, and no longer cache.
+        Caches data per (timeframe, lookback_period), expiring with each new candle.
+        Should only be used for pairlists which need "on time" expiration, and no longer cache.
+        :param pairs: List of pairs, timeframes to refresh
+        :param lookback_period: Amount of candles to fetch.
+            Downloads lookback_period + 1 candles, as measuring a change over N candles
+            requires N + 1 candles of data.
         """
 
         timeframes = {p[1] for p in pairs}
         for timeframe in timeframes:
-            if (timeframe, since_ms) not in self._expiring_candle_cache:
+            if (timeframe, lookback_period) not in self._expiring_candle_cache:
                 timeframe_in_sec = timeframe_to_seconds(timeframe)
                 # Initialise cache
-                self._expiring_candle_cache[(timeframe, since_ms)] = PeriodicCache(
+                self._expiring_candle_cache[(timeframe, lookback_period)] = PeriodicCache(
                     ttl=timeframe_in_sec, maxsize=1000
                 )
 
         # Get candles from cache
         candles = {
-            c: self._expiring_candle_cache[(c[1], since_ms)].get(c, None)
+            c: self._expiring_candle_cache[(c[1], lookback_period)].get(c, None)
             for c in pairs
-            if c in self._expiring_candle_cache[(c[1], since_ms)]
+            if c in self._expiring_candle_cache[(c[1], lookback_period)]
         }
         pairs_to_download = [p for p in pairs if p not in candles]
-        if pairs_to_download:
-            candles_new = self.refresh_latest_ohlcv(
-                pairs_to_download, since_ms=since_ms, cache=False
-            )
+        for timeframe in timeframes:
+            tf_pairs = [p for p in pairs_to_download if p[1] == timeframe]
+            if not tf_pairs:
+                continue
+            since_ms = dt_ts(date_minus_candles(timeframe, lookback_period + 1))
+            candles_new = self.refresh_latest_ohlcv(tf_pairs, since_ms=since_ms, cache=False)
             for c, val in candles_new.items():
                 candles[c] = val
-                self._expiring_candle_cache[(c[1], since_ms)][c] = val
+                self._expiring_candle_cache[(c[1], lookback_period)][c] = val
         return candles
 
     def _now_is_time_to_refresh(self, pair: str, timeframe: str, candle_type: CandleType) -> bool:
@@ -3080,6 +3108,10 @@ class Exchange:
     # fetch Trade data stuff
 
     def needed_candle_for_trades_ms(self, timeframe: str, candle_type: CandleType) -> int:
+        """
+        Get the timestamp in milliseconds of the earliest candle needed to fetch trades
+        for the given timeframe and candle type.
+        """
         candle_limit = self.ohlcv_candle_limit(timeframe, candle_type)
         tf_s = timeframe_to_seconds(timeframe)
         candles_fetched = candle_limit * self.required_candle_call_count
@@ -3087,11 +3119,8 @@ class Exchange:
         max_candles = self._config["orderflow"]["max_candles"]
 
         required_candles = min(max_candles, candles_fetched)
-        move_to = (
-            tf_s * candle_limit * required_candles
-            if required_candles > candle_limit
-            else (max_candles + 1) * tf_s
-        )
+        # +1 candle as a safety margin so the oldest required candle is fully covered.
+        move_to = (required_candles + 1) * tf_s
 
         now = timeframe_to_next_date(timeframe)
         return int((now - timedelta(seconds=move_to)).timestamp() * 1000)
@@ -3169,11 +3198,7 @@ class Exchange:
                             last_cached_ms = all_stored_ticks_df.iloc[-1]["timestamp"]
                             from_id = all_stored_ticks_df.iloc[-1]["id"]
                             # only use cached if it's closer than first_candle_ms
-                            since_ms = (
-                                last_cached_ms
-                                if last_cached_ms > first_candle_ms
-                                else first_candle_ms
-                            )
+                            since_ms = max(first_candle_ms, last_cached_ms)
                         else:
                             # Skip cache, it's too old
                             all_stored_ticks_df = DataFrame(
@@ -3829,6 +3854,8 @@ class Exchange:
             self._log_exchange_response("set_margin_mode", res)
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
+        except ccxt.MarginModeAlreadySet as e:
+            logger.debug(f"Margin mode already set for {pair}. Message: {e}")
         except (ccxt.BadRequest, ccxt.OperationRejected) as e:
             if not accept_fail:
                 raise TemporaryError(
@@ -3963,7 +3990,14 @@ class Exchange:
         fees: float = 0
 
         if not df.empty:
-            df1 = df[(df["date"] >= open_date) & (df["date"] <= close_date)]
+            dates = df["date"]
+            unit = dates.dtype.unit
+            # Timestamps must be converted to column unit for dry/live mode
+            # where open/close dates can have microsecond precision - but the column may not have
+            # that precision.
+            lo = Timestamp(open_date).ceil(unit).as_unit(unit)
+            hi = Timestamp(close_date).floor(unit).as_unit(unit)
+            df1 = df.iloc[dates.searchsorted(lo, "left") : dates.searchsorted(hi, "right")]
             fees = sum(df1["open_fund"] * df1["open_mark"] * amount)
         if isnan(fees):
             fees = 0.0

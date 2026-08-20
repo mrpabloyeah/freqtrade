@@ -31,6 +31,7 @@ from freqtrade.exchange import (
     Kraken,
     date_minus_candles,
     market_is_active,
+    timeframe_to_msecs,
     timeframe_to_prev_date,
 )
 from freqtrade.exchange.common import (
@@ -39,7 +40,7 @@ from freqtrade.exchange.common import (
     calculate_backoff,
 )
 from freqtrade.resolvers.exchange_resolver import ExchangeResolver
-from freqtrade.util import dt_now, dt_ts
+from freqtrade.util import dt_now, dt_ts, dt_utc
 from tests.conftest import (
     EXMS,
     generate_test_data_raw,
@@ -213,8 +214,59 @@ def test_init_ccxt_kwargs(default_conf, mocker, caplog):
 
 def test_destroy(default_conf, mocker, caplog):
     caplog.set_level(logging.DEBUG)
-    get_patched_exchange(mocker, default_conf)
-    assert log_has("Exchange object destroyed, closing async loop", caplog)
+    exchange = get_patched_exchange(mocker, default_conf)
+
+    closed = False
+
+    async def _close():
+        nonlocal closed
+        closed = True
+
+    # Simulate a "real" async session that needs closing.
+    exchange._api_async.close = _close
+    exchange._api_async.session = MagicMock()
+
+    exchange.close()
+    # Prevent the __del__ triggered close (at GC time) from touching the now-closed loop.
+    exchange._api_async.session = None
+
+    assert closed
+    assert log_has("Closing async ccxt session.", caplog)
+
+
+def test_destroy_socks_session(default_conf, mocker):
+    exchange = get_patched_exchange(mocker, default_conf)
+
+    closed = False
+
+    async def _close():
+        nonlocal closed
+        closed = True
+
+    # ccxt also warns about leftover socks proxy sessions - so these must be closed, too.
+    exchange._api_async.close = _close
+    exchange._api_async.session = None
+    exchange._api_async.socks_proxy_sessions = {"socks5://127.0.0.1:9050": MagicMock()}
+
+    exchange.close()
+
+    assert closed
+
+
+def test_destroy_close_error(default_conf, mocker, caplog):
+    exchange = get_patched_exchange(mocker, default_conf)
+
+    async def _close():
+        raise ValueError("Test error")
+
+    exchange._api_async.close = _close
+    exchange._api_async.session = MagicMock()
+
+    # A failing session close must not prevent the loop from being closed.
+    exchange.close()
+
+    assert log_has("Error closing async ccxt session: ValueError Test error", caplog)
+    assert exchange.loop.is_closed()
 
 
 def test_init_exception(default_conf, mocker):
@@ -247,17 +299,16 @@ def test_exchange_resolver(default_conf, mocker, caplog):
     mocker.patch(f"{EXMS}.validate_pricing")
     default_conf["exchange"]["name"] = "zaif"
     exchange = ExchangeResolver.load_exchange(default_conf)
+    msg = r"No .* specific subclass found. Using the generic exchange class instead."
     assert isinstance(exchange, Exchange)
-    assert log_has_re(r"No .* specific subclass found. Using the generic class instead.", caplog)
+    assert log_has_re(msg, caplog)
     caplog.clear()
 
     default_conf["exchange"]["name"] = "Bybit"
     exchange = ExchangeResolver.load_exchange(default_conf)
     assert isinstance(exchange, Exchange)
     assert isinstance(exchange, Bybit)
-    assert not log_has_re(
-        r"No .* specific subclass found. Using the generic class instead.", caplog
-    )
+    assert not log_has_re(msg, caplog)
     caplog.clear()
 
     default_conf["exchange"]["name"] = "kraken"
@@ -265,9 +316,7 @@ def test_exchange_resolver(default_conf, mocker, caplog):
     assert isinstance(exchange, Exchange)
     assert isinstance(exchange, Kraken)
     assert not isinstance(exchange, Binance)
-    assert not log_has_re(
-        r"No .* specific subclass found. Using the generic class instead.", caplog
-    )
+    assert not log_has_re(msg, caplog)
 
     default_conf["exchange"]["name"] = "binance"
     exchange = ExchangeResolver.load_exchange(default_conf)
@@ -275,9 +324,7 @@ def test_exchange_resolver(default_conf, mocker, caplog):
     assert isinstance(exchange, Binance)
     assert not isinstance(exchange, Kraken)
 
-    assert not log_has_re(
-        r"No .* specific subclass found. Using the generic class instead.", caplog
-    )
+    assert not log_has_re(msg, caplog)
 
     # Test mapping
     default_conf["exchange"]["name"] = "binanceus"
@@ -722,7 +769,7 @@ def test_validate_stakecurrency_error(default_conf, mocker):
 def test_get_quote_currencies(default_conf, mocker):
     ex = get_patched_exchange(mocker, default_conf)
 
-    assert set(ex.get_quote_currencies()) == set(["USD", "ETH", "BTC", "USDT", "BUSD"])
+    assert set(ex.get_quote_currencies()) == {"USD", "ETH", "BTC", "USDT", "BUSD"}
 
 
 @pytest.mark.parametrize(
@@ -2135,7 +2182,6 @@ def test_fetch_orders_multi(
 
     mocker.patch(f"{EXMS}.exchange_has", has_resp)
 
-    #
     resp = exchange.fetch_orders("mocked", start_time)
     assert api_mock.fetch_orders.call_count == expected[0]
     assert api_mock.fetch_open_orders.call_count == expected[1]
@@ -2352,7 +2398,7 @@ def test_get_conversion_rate(default_conf_usdt, mocker, exchange_name):
     api_mock = MagicMock()
     tick = {
         "ETH/USDT": {
-            "last": 42,
+            "last": None,
         },
         "BCH/USDT": {
             "last": 41,
@@ -2364,7 +2410,10 @@ def test_get_conversion_rate(default_conf_usdt, mocker, exchange_name):
     tick2 = {
         "ADA/USDT:USDT": {
             "last": 2.5,
-        }
+        },
+        "ETH/USDT:USDT": {
+            "last": 42,
+        },
     }
     mocker.patch(f"{EXMS}.exchange_has", return_value=True)
     api_mock.fetch_tickers = MagicMock(side_effect=[tick, tick2])
@@ -2375,14 +2424,24 @@ def test_get_conversion_rate(default_conf_usdt, mocker, exchange_name):
     # retrieve original ticker
     assert exchange.get_conversion_rate("USDT", "USDT") == 1
     assert api_mock.fetch_tickers.call_count == 0
+    # ETH must fall back to the "others" market since ETH/USDT is None.
     assert exchange.get_conversion_rate("ETH", "USDT") == 42
     assert exchange.get_conversion_rate("ETH", "USDC") is None
     assert exchange.get_conversion_rate("ETH", "BTC") == 250
+    assert api_mock.fetch_tickers.call_count == 2
+    api_mock.fetch_tickers.reset_mock()
+    api_mock.fetch_tickers.side_effect = [tick, tick2]
+    # Cached tickers
     assert exchange.get_conversion_rate("BTC", "ETH") == 0.004
 
-    assert api_mock.fetch_tickers.call_count == 1
+    assert api_mock.fetch_tickers.call_count == 0
+    # Uncached tickers
     api_mock.fetch_tickers.reset_mock()
+    assert exchange.get_conversion_rate("BTC", "ETH", cached=False) == 0.004
+    assert api_mock.fetch_tickers.call_count == 1
 
+    api_mock.fetch_tickers.reset_mock()
+    exchange._fetch_tickers_cache.clear()
     assert exchange.get_conversion_rate("ADA", "USDT") == 2.5
     # Only the call to the "others" market
     assert api_mock.fetch_tickers.call_count == 1
@@ -2846,6 +2905,37 @@ def test_refresh_latest_trades(
     caplog.clear()
 
 
+def test_needed_candle_for_trades_ms(mocker, default_conf, time_machine) -> None:
+    # Freeze mid-candle; the next "5m" candle boundary is 00:05:00.
+    time_machine.move_to(dt_utc(2026, 5, 1, 0, 3), tick=False)
+    next_candle = dt_utc(2026, 5, 1, 0, 5)
+
+    default_conf["orderflow"] = {"max_candles": 1500}
+    exchange = get_patched_exchange(mocker, default_conf)
+    mocker.patch(f"{EXMS}.ohlcv_candle_limit", return_value=500)
+
+    tf = "5m"
+
+    # required_candles = min(max_candles=1500, candles_fetched=500*1=500) = 500 (+1 margin)
+    exchange.required_candle_call_count = 1
+    # 501 candles * 5m = 2505 minutes ~= 1.7 days
+    expected = dt_ts(next_candle - timedelta(minutes=501 * 5))
+    assert exchange.needed_candle_for_trades_ms(tf, CandleType.SPOT) == expected
+
+    # required_candles = min(max_candles=1500, candles_fetched=500*3=1500) = 1500 (+1 margin)
+    exchange.required_candle_call_count = 3
+    # 1501 candles * 5m = 7505 minutes ~= 5.2 days
+    expected = dt_ts(next_candle - timedelta(minutes=1501 * 5))
+    assert exchange.needed_candle_for_trades_ms(tf, CandleType.SPOT) == expected
+
+    # required_candles capped at max_candles=800 (candles_fetched=500*5=2500), +1 margin
+    default_conf["orderflow"]["max_candles"] = 800
+    exchange.required_candle_call_count = 5
+    # 801 candles * 5m = 4005 minutes ~= 2.8 days
+    expected = dt_ts(next_candle - timedelta(minutes=801 * 5))
+    assert exchange.needed_candle_for_trades_ms(tf, CandleType.SPOT) == expected
+
+
 @pytest.mark.parametrize("candle_type", [CandleType.FUTURES, CandleType.MARK, CandleType.SPOT])
 def test_refresh_latest_ohlcv_cache(mocker, default_conf, candle_type, time_machine) -> None:
     start = datetime(2021, 8, 1, 0, 0, 0, 0, tzinfo=UTC)
@@ -2965,23 +3055,31 @@ def test_refresh_ohlcv_with_cache(mocker, default_conf, time_machine) -> None:
 
     assert len(exchange._expiring_candle_cache) == 0
 
-    res = exchange.refresh_ohlcv_with_cache(pairs, start.timestamp())
-    assert ohlcv_mock.call_count == 1
-    assert ohlcv_mock.call_args_list[0][0][0] == pairs
-    assert len(ohlcv_mock.call_args_list[0][0][0]) == 5
+    res = exchange.refresh_ohlcv_with_cache(pairs, lookback_period=5)
+    # One download call per timeframe
+    assert ohlcv_mock.call_count == 3
+    requested = [p for call in ohlcv_mock.call_args_list for p in call[0][0]]
+    assert set(requested) == set(pairs)
+    assert len(requested) == 5
+    for call in ohlcv_mock.call_args_list:
+        timeframe = call[0][0][0][1]
+        expected_since = dt_ts(timeframe_to_prev_date(timeframe, start)) - 6 * timeframe_to_msecs(
+            timeframe
+        )
+        assert call[1]["since_ms"] == expected_since
 
     assert len(res) == 5
     # length of 3 - as we have 3 different timeframes
     assert len(exchange._expiring_candle_cache) == 3
 
     ohlcv_mock.reset_mock()
-    res = exchange.refresh_ohlcv_with_cache(pairs, start.timestamp())
+    res = exchange.refresh_ohlcv_with_cache(pairs, lookback_period=5)
     assert ohlcv_mock.call_count == 0
     assert len(res) == 5
 
     # # re-run with one additional pair
     res = exchange.refresh_ohlcv_with_cache(
-        pairs + [("NEW/PAIR", "1d", CandleType.SPOT)], start.timestamp()
+        pairs + [("NEW/PAIR", "1d", CandleType.SPOT)], lookback_period=5
     )
     assert ohlcv_mock.call_count == 1
     assert len(res) == 6
@@ -2990,7 +3088,7 @@ def test_refresh_ohlcv_with_cache(mocker, default_conf, time_machine) -> None:
     time_machine.move_to(start + timedelta(minutes=6), tick=False)
 
     ohlcv_mock.reset_mock()
-    res = exchange.refresh_ohlcv_with_cache(pairs, start.timestamp())
+    res = exchange.refresh_ohlcv_with_cache(pairs, lookback_period=5)
     assert ohlcv_mock.call_count == 1
     assert len(ohlcv_mock.call_args_list[0][0][0]) == 1
     assert len(res) == 5
@@ -2999,20 +3097,31 @@ def test_refresh_ohlcv_with_cache(mocker, default_conf, time_machine) -> None:
     time_machine.move_to(start + timedelta(hours=2), tick=False)
 
     ohlcv_mock.reset_mock()
-    res = exchange.refresh_ohlcv_with_cache(pairs, start.timestamp())
-    assert ohlcv_mock.call_count == 1
-    assert len(ohlcv_mock.call_args_list[0][0][0]) == 2
+    res = exchange.refresh_ohlcv_with_cache(pairs, lookback_period=5)
+    assert ohlcv_mock.call_count == 2
+    requested = [p for call in ohlcv_mock.call_args_list for p in call[0][0]]
+    assert len(requested) == 2
     assert len(res) == 5
 
     # Expire all caches
     time_machine.move_to(start + timedelta(days=1, hours=2), tick=False)
 
     ohlcv_mock.reset_mock()
-    res = exchange.refresh_ohlcv_with_cache(pairs, start.timestamp())
-    assert ohlcv_mock.call_count == 1
-    assert len(ohlcv_mock.call_args_list[0][0][0]) == 5
-    assert ohlcv_mock.call_args_list[0][0][0] == pairs
+    res = exchange.refresh_ohlcv_with_cache(pairs, lookback_period=5)
+    assert ohlcv_mock.call_count == 3
+    requested = [p for call in ohlcv_mock.call_args_list for p in call[0][0]]
+    assert set(requested) == set(pairs)
     assert len(res) == 5
+
+    # Cache keys must remain stable over time
+    assert len(exchange._expiring_candle_cache) == 3
+    # Expired entries are evicted when the cache is written to again -
+    # NEW/PAIR was never re-requested, so only the 3 base pairs remain.
+    assert exchange._expiring_candle_cache[("1d", 5)].currsize == 3
+
+    # A different lookback period uses separate caches
+    res = exchange.refresh_ohlcv_with_cache(pairs, lookback_period=6)
+    assert len(exchange._expiring_candle_cache) == 6
 
 
 def test_refresh_latest_ohlcv_funding_rate(mocker, default_conf_usdt, caplog) -> None:
@@ -4525,6 +4634,27 @@ def test_merge_ft_has_dict(default_conf, mocker):
     assert ex._ft_has["DeadBeef"] == 20
 
 
+@pytest.mark.parametrize(
+    "exchange_name,expected",
+    [
+        # ccxt reports account equity for these - their "total" carries unrealized PnL
+        ("binance", True),
+        ("hyperliquid", True),
+        ("okx", True),
+        ("bitget", True),
+        # ccxt reports plain wallet balance for these
+        ("bybit", False),
+        ("gate", False),
+        ("kraken", False),
+    ],
+)
+def test_balance_includes_unrealized_pnl(default_conf, mocker, exchange_name, expected):
+    default_conf["trading_mode"] = "futures"
+    default_conf["margin_mode"] = "isolated"
+    exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)
+    assert exchange.balance_includes_unrealized_pnl() is expected
+
+
 def test_get_valid_pair_combination(default_conf, mocker, markets):
     mocker.patch.multiple(
         EXMS,
@@ -4544,7 +4674,7 @@ def test_get_valid_pair_combination(default_conf, mocker, markets):
     assert "ETH/USDT:USDT" in multicombs
 
     with pytest.raises(ValueError, match=r"Could not combine.* to get a valid pair."):
-        for x in ex.get_valid_pair_combination("NOPAIR", "ETH"):
+        for _x in ex.get_valid_pair_combination("NOPAIR", "ETH"):
             pass
 
 
@@ -4862,7 +4992,6 @@ def test_ohlcv_candle_limit(default_conf, mocker, exchange_name):
         ("BTCUSDT", None, "USDT", "binance", True, False, False, "spot", {}, False),
         ("USDT/BTC", "BTC", None, "binance", True, False, False, "spot", {}, False),
         ("BTCUSDT", "BTC", None, "binance", True, False, False, "spot", {}, False),
-        ("BTC/USDT", "BTC", "USDT", "binance", True, False, False, "spot", {}, True),
         # Futures mode, spot pair
         ("BTC/USDT", "BTC", "USDT", "binance", True, False, False, "futures", {}, False),
         ("BTC/USDT", "BTC", "USDT", "binance", True, False, False, "margin", {}, False),
@@ -5152,7 +5281,7 @@ def test_calculate_fee_rate(mocker, default_conf, order, expected, unknown_fee_r
 
 
 @pytest.mark.parametrize(
-    "retrycount,max_retries,expected",
+    "remaining_retries,max_retries,expected",
     [
         (0, 3, 10),
         (1, 3, 5),
@@ -5173,8 +5302,8 @@ def test_calculate_fee_rate(mocker, default_conf, order, expected, unknown_fee_r
         (5, 5, 1),
     ],
 )
-def test_calculate_backoff(retrycount, max_retries, expected):
-    assert calculate_backoff(retrycount, max_retries) == expected
+def test_calculate_backoff(remaining_retries, max_retries, expected):
+    assert calculate_backoff(remaining_retries, max_retries) == expected
 
 
 @pytest.mark.parametrize("exchange_name", EXCHANGES)
@@ -5273,7 +5402,7 @@ def test_get_stake_amount_considering_leverage(
 
 
 @pytest.mark.parametrize("margin_mode", [(MarginMode.CROSS), (MarginMode.ISOLATED)])
-def test_set_margin_mode(mocker, default_conf, margin_mode):
+def test_set_margin_mode(mocker, default_conf, margin_mode, caplog):
     api_mock = MagicMock()
     api_mock.set_margin_mode = MagicMock()
     type(api_mock).has = PropertyMock(return_value={"setMarginMode": True})
@@ -5290,6 +5419,15 @@ def test_set_margin_mode(mocker, default_conf, margin_mode):
         margin_mode=margin_mode,
     )
 
+    # MarginModeAlreadySet is safe to ignore and should not raise.
+    caplog.set_level(logging.DEBUG)
+    api_mock.set_margin_mode = MagicMock(
+        side_effect=ccxt.MarginModeAlreadySet("Margin mode already set")
+    )
+    exchange = get_patched_exchange(mocker, default_conf, api_mock, exchange="binance")
+    exchange.set_margin_mode("XRP/USDT", margin_mode)
+    assert log_has_re(r"Margin mode already set for XRP/USDT\..*", caplog)
+
 
 @pytest.mark.parametrize(
     "exchange_name, trading_mode, margin_mode, allow_none_margin_mode, exception_thrown",
@@ -5299,11 +5437,6 @@ def test_set_margin_mode(mocker, default_conf, margin_mode):
         ("kraken", TradingMode.SPOT, None, False, False),
         ("kraken", TradingMode.MARGIN, MarginMode.ISOLATED, False, True),
         ("kraken", TradingMode.FUTURES, MarginMode.ISOLATED, False, True),
-        ("bitmart", TradingMode.SPOT, None, False, False),
-        ("bitmart", TradingMode.MARGIN, MarginMode.CROSS, False, True),
-        ("bitmart", TradingMode.MARGIN, MarginMode.ISOLATED, False, True),
-        ("bitmart", TradingMode.FUTURES, MarginMode.CROSS, False, True),
-        ("bitmart", TradingMode.FUTURES, MarginMode.ISOLATED, False, True),
         ("gate", TradingMode.MARGIN, MarginMode.ISOLATED, False, True),
         ("okx", TradingMode.SPOT, None, False, False),
         ("okx", TradingMode.MARGIN, MarginMode.CROSS, False, True),
@@ -5398,28 +5531,35 @@ def test_get_max_leverage_from_margin(default_conf, mocker, pair, nominal_value,
 @pytest.mark.parametrize(
     "size,funding_rate,mark_price,funding_fee",
     [
-        (10, 0.0001, 2.0, 0.002),
-        (10, 0.0002, 2.0, 0.004),
-        (10, 0.0002, 2.5, 0.005),
+        (10, 0.0001, 1.0, 0.002),
+        (10, 0.0002, 1.0, 0.004),
+        (10, 0.0002, 1.25, 0.005),
         (10, 0.0002, nan, 0.0),
     ],
 )
 def test_calculate_funding_fees(default_conf, mocker, size, funding_rate, mark_price, funding_fee):
     exchange = get_patched_exchange(mocker, default_conf)
-    prior_date = timeframe_to_prev_date("1h", datetime.now(UTC) - timedelta(hours=1))
-    trade_date = timeframe_to_prev_date("1h", datetime.now(UTC))
+    # Include microseconds to ensure it's not problematic.
+    now_dt = dt_utc(2026, 4, 3, 12, 5, 0, 12345)
+    trade_date = timeframe_to_prev_date("1h", now_dt)
+    prior_date = timeframe_to_prev_date("1h", trade_date - timedelta(hours=1))
+    prior2_date = timeframe_to_prev_date("1h", now_dt - timedelta(hours=2))
     funding_rates = DataFrame(
         [
-            {"date": prior_date, "open": funding_rate},  # Line not used.
+            {"date": prior2_date, "open": funding_rate},  # Line not used.
+            {"date": prior_date, "open": funding_rate},
             {"date": trade_date, "open": funding_rate},
         ]
     )
     mark_rates = DataFrame(
         [
+            {"date": prior2_date, "open": mark_price},
             {"date": prior_date, "open": mark_price},
             {"date": trade_date, "open": mark_price},
         ]
     )
+    funding_rates["date"] = funding_rates["date"].dt.as_unit("ms")
+    mark_rates["date"] = mark_rates["date"].dt.as_unit("ms")
     df = exchange.combine_funding_and_mark(funding_rates, mark_rates)
 
     assert (
@@ -5427,8 +5567,8 @@ def test_calculate_funding_fees(default_conf, mocker, size, funding_rate, mark_p
             df,
             amount=size,
             is_short=True,
-            open_date=trade_date,
-            close_date=trade_date,
+            open_date=now_dt - timedelta(hours=1, minutes=30),
+            close_date=now_dt,
         )
         == funding_fee
     )

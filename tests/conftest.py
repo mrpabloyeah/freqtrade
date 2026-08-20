@@ -20,6 +20,7 @@ from freqtrade.enums import CandleType, MarginMode, SignalDirection, TradingMode
 from freqtrade.exchange import Exchange, timeframe_to_minutes, timeframe_to_seconds
 from freqtrade.freqtradebot import FreqtradeBot
 from freqtrade.persistence import LocalTrade, Order, Trade, init_db
+from freqtrade.persistence.custom_data import _CustomData
 from freqtrade.resolvers import ExchangeResolver
 from freqtrade.system import set_mp_start_method
 from freqtrade.util import dt_now, dt_ts
@@ -86,7 +87,6 @@ class FixtureScheduler(LoadScopeScheduling):
                 return exchange_id
             except Exception as e:
                 print(e)
-                pass
 
         return nodeid
 
@@ -208,7 +208,7 @@ def generate_test_data_raw(timeframe: str, size: int, start: str = "2020-07-05",
     """Generates data in the ohlcv format used by ccxt"""
     df = generate_test_data(timeframe, size, start, random_seed)
     df["date"] = df.loc[:, "date"].dt.as_unit("ms").astype("int64")
-    return list(list(x) for x in zip(*(df[x].values.tolist() for x in df.columns), strict=False))
+    return [list(x) for x in zip(*(df[x].values.tolist() for x in df.columns), strict=False)]
 
 
 # Source: https://stackoverflow.com/questions/29881236/how-to-mock-asyncio-coroutines
@@ -533,6 +533,9 @@ def patch_torch_initlogs(mocker) -> None:
 
         module_name = "torch"
         mocked_module = types.ModuleType(module_name)
+        # SciPy's array-API dispatch probes ``torch.Tensor`` to classify inputs;
+        # expose a dummy so scipy.stats stays importable/usable under the mock.
+        mocked_module.Tensor = type("Tensor", (), {})
         sys.modules[module_name] = mocked_module
     else:
         try:
@@ -579,6 +582,21 @@ def patch_coingecko(mocker) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def dispose_db_engine():
+    """
+    Dispose the database engine after each test to release its pooled connection.
+    Without this, leaked connections accumulate and are finalized at random points
+    by the GC, emitting ResourceWarnings in unrelated tests.
+    """
+    yield
+    if (session := getattr(Trade, "session", None)) is not None:
+        bind = session.get_bind()
+        session.remove()
+        _CustomData.session.remove()
+        bind.dispose()
+
+
 @pytest.fixture(scope="function")
 def init_persistence(default_conf):
     init_db(default_conf["db_url"])
@@ -621,7 +639,7 @@ def get_default_conf(testdatadir):
         },
         "exchange": {
             "name": "binance",
-            "key": "key",
+            "api_key": "key",
             "enable_ws": False,
             "secret": "secret",
             "pair_whitelist": ["ETH/BTC", "LTC/BTC", "XRP/BTC", "NEO/BTC"],
@@ -667,7 +685,7 @@ def get_default_conf_usdt(testdatadir):
             "exchange": {
                 "name": "binance",
                 "enabled": True,
-                "key": "key",
+                "api_key": "key",
                 "enable_ws": False,
                 "secret": "secret",
                 "pair_whitelist": [

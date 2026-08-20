@@ -158,7 +158,6 @@ class TestCCXTExchange:
                 assert currency in balances
                 assert isinstance(balance, dict)
                 assert balance == balances[currency]
-            pass
         else:
             pytest.skip(f"No sample Balances available for exchange {exchangename}")
 
@@ -294,7 +293,12 @@ class TestCCXTExchange:
         timeframe_ms = timeframe_to_msecs(timeframe)
         timeframe_ms_8h = timeframe_to_msecs("8h")
         now = timeframe_to_prev_date(timeframe, datetime.now(UTC))
-        for offset_days in (360, 120, 30, 10, 5, 2):
+        offset_attempts = (360, 120, 30, 10, 5, 2)
+        if candle_type == CandleType.FUNDING_RATE and exchange.id == "gate":
+            # gate only provides 180 days of funding fee history
+            offset_attempts = (179, 120, 30, 10, 5)
+
+        for offset_days in offset_attempts:
             since = now - timedelta(days=offset_days)
             since_ms = int(since.timestamp() * 1000)
 

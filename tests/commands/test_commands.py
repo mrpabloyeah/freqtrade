@@ -811,6 +811,24 @@ def test_download_and_install_ui(mocker, tmp_path):
     assert read_ui_version(folder) == "22"
 
 
+@pytest.mark.parametrize("dangerous_path", ["../../dangerous.txt", "/etc/passwd", "../foo"])
+def test_download_and_install_ui_dangerous_paths(mocker, tmp_path, dangerous_path):
+    requests_mock = MagicMock()
+    file_like_object = BytesIO()
+    with ZipFile(file_like_object, mode="w") as zipfile:
+        zipfile.writestr(dangerous_path, "content")
+    file_like_object.seek(0)
+    requests_mock.content = file_like_object.read()
+
+    mocker.patch("freqtrade.commands.deploy_ui.requests.get", return_value=requests_mock)
+
+    folder = tmp_path / "uitests_dl_dangerous"
+    folder.mkdir(exist_ok=True)
+
+    with pytest.raises(OperationalException, match="Dangerous path in zipfile"):
+        download_and_install_ui(folder, "http://whatever.xxx/download/file.zip", "22")
+
+
 def test_get_ui_download_url(mocker):
     response = MagicMock()
     responses = [
@@ -878,7 +896,7 @@ def test_get_ui_download_url_direct(mocker):
     assert last_version == "0.0.1"
     assert x == "http://download1.zip"
 
-    with pytest.raises(ValueError, match=r"UI-Version not found\."):
+    with pytest.raises(OperationalException, match=r"UI-Version not found\."):
         x, last_version = get_ui_download_url("0.0.3", False)
 
 
@@ -1024,7 +1042,7 @@ def test_download_data_all_pairs(mocker, markets):
     pargs = get_args(args)
     pargs["config"] = None
     start_download_data(pargs)
-    expected = set(["BTC/USDT", "ETH/USDT", "XRP/USDT", "NEO/USDT", "TKN/USDT"])
+    expected = {"BTC/USDT", "ETH/USDT", "XRP/USDT", "NEO/USDT", "TKN/USDT"}
     assert set(dl_mock.call_args_list[0][1]["pairs"]) == expected
     assert dl_mock.call_count == 1
 
@@ -1040,7 +1058,7 @@ def test_download_data_all_pairs(mocker, markets):
     pargs = get_args(args)
     pargs["config"] = None
     start_download_data(pargs)
-    expected = set(["BTC/USDT", "ETH/USDT", "LTC/USDT", "XRP/USDT", "NEO/USDT", "TKN/USDT"])
+    expected = {"BTC/USDT", "ETH/USDT", "LTC/USDT", "XRP/USDT", "NEO/USDT", "TKN/USDT"}
     assert set(dl_mock.call_args_list[0][1]["pairs"]) == expected
 
 
@@ -2049,7 +2067,7 @@ def test_start_strategy_updater(mocker, tmp_path):
     pargs["config"] = None
     start_strategy_update(pargs)
     # Number of strategies in the test directory
-    assert sc_mock.call_count == 12
+    assert sc_mock.call_count == 13
 
     sc_mock.reset_mock()
     args = [

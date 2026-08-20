@@ -7,7 +7,6 @@ It's subclasses handle and storing data from disk.
 import logging
 import re
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 
 class IDataHandler(ABC):
-    _OHLCV_REGEX = r"^([\w-]+)\-(\d+[a-zA-Z]{1,2})\-?([a-zA-Z_]*)?(?=\.)"
-    _TRADES_REGEX = r"^([\w-]+)\-(trades)?(?=\.)"
+    _OHLCV_REGEX = re.compile(r"^([\w-]+)\-(\d+[a-zA-Z]{1,2})\-?([a-zA-Z_]*)?(?=\.)")
+    _TRADES_REGEX = re.compile(r"^([\w-]+)\-(trades)?(?=\.)")
 
     def __init__(self, datadir: Path) -> None:
         self._datadir = datadir
@@ -57,8 +56,7 @@ class IDataHandler(ABC):
         if trading_mode == TradingMode.FUTURES:
             datadir = datadir.joinpath("futures")
         _tmp = [
-            re.search(cls._OHLCV_REGEX, p.name)
-            for p in datadir.glob(f"*.{cls._get_file_extension()}")
+            cls._OHLCV_REGEX.search(p.name) for p in datadir.glob(f"*.{cls._get_file_extension()}")
         ]
         return [
             (
@@ -156,8 +154,7 @@ class IDataHandler(ABC):
         if trading_mode == TradingMode.FUTURES:
             datadir = datadir.joinpath("futures")
         _tmp = [
-            re.search(cls._TRADES_REGEX, p.name)
-            for p in datadir.glob(f"*.{cls._get_file_extension()}")
+            cls._TRADES_REGEX.search(p.name) for p in datadir.glob(f"*.{cls._get_file_extension()}")
         ]
         return [
             cls.rebuild_pair_from_filename(match[1])
@@ -197,10 +194,8 @@ class IDataHandler(ABC):
         :return: List of Pairs
         """
         _ext = cls._get_file_extension()
-        _tmp = [
-            re.search(r"^(\S+)(?=\-trades." + _ext + ")", p.name)
-            for p in datadir.glob(f"*trades.{_ext}")
-        ]
+        _regex = re.compile(rf"^(\S+)(?=\-trades\.{re.escape(_ext)})")
+        _tmp = [_regex.search(p.name) for p in datadir.glob(f"*trades.{_ext}")]
         # Check if regex found something and only return these results to avoid exceptions.
         return [cls.rebuild_pair_from_filename(match[0]) for match in _tmp if match]
 
@@ -367,7 +362,7 @@ class IDataHandler(ABC):
         :return: DataFrame with ohlcv data, or empty DataFrame
         """
         # Fix startup period
-        timerange_startup = deepcopy(timerange)
+        timerange_startup = timerange.copy() if timerange else None
         if startup_candles > 0 and timerange_startup:
             timerange_startup.subtract_start(timeframe_to_seconds(timeframe) * startup_candles)
 
